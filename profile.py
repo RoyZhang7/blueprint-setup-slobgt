@@ -1,199 +1,599 @@
-"""Variable number of nodes in a lan. You have the option of picking from one
-of several standard images we provide, or just use the default (typically a recent
-version of Ubuntu). You may also optionally pick the specific hardware type for
-all the nodes in the lan. 
+#!/usr/bin/env python
+#
+# CloudLab profile: Kubernetes (Kubespray) cluster, or a plain single-node
+# Docker host, with the Blueprint "bridges" stack checked out and built on
+# node-0:
+#
+#   - docc-lab/blueprint-docc-mod            (Blueprint fork, DSB-SN wiring, d2k8s)
+#   - docc-lab/opentelemetry-collector-contrib (collector fork w/ priorityprocessor)
+#   - docc-lab/bridges                       (offline reconstruction / analysis)
+#   - docc-lab/DeathStarBench                (wrk2 + social-graph seeder)
+#
+# The Kubernetes half is the stock Utah k8s-profile
+# (https://gitlab.flux.utah.edu/johnsond/k8s-profile); the bridges half is
+# setup-bridges.sh (head node) + setup-docker.sh / setup-sysctl.sh (all nodes).
 
-Instructions:
-Wait for the experiment to start, and then log into one or more of the nodes
-by clicking on them in the toplogy, and choosing the `shell` menu option.
-Use `sudo` to run root commands. 
-"""
-
-# Import the Portal object.
 import geni.portal as portal
-# Import the ProtoGENI library.
-import geni.rspec.pg as pg
+import geni.rspec.pg as RSpec
+import geni.rspec.igext as IG
 # Emulab specific extensions.
 import geni.rspec.emulab as emulab
+from lxml import etree as ET
+import crypt
+import random
+import os
+import hashlib
+import os.path
+import sys
 
-# Create a portal context, needed to defined parameters
+TBCMD = "sudo mkdir -p /local/setup && sudo chown `geni-get user_urn | cut -f4 -d+` /local/setup && sudo -u `geni-get user_urn | cut -f4 -d+` -Hi /bin/bash -c '/local/repository/setup-driver.sh >/local/logs/setup.log 2>&1'"
+
+#
+# For now, disable the testbed's root ssh key service until we can remove ours.
+# It seems to race (rarely) with our startup scripts.
+#
+disableTestbedRootKeys = True
+
+#
+# Create our in-memory model of the RSpec -- the resources we're going
+# to request in our experiment, and their configuration.
+#
+rspec = RSpec.Request()
+
+#
+# This geni-lib script is designed to run in the CloudLab Portal.
+#
 pc = portal.Context()
 
-# Create a Request object to start building the RSpec.
-request = pc.makeRequestRSpec()
+#
+# Cluster shape.
+#
+pc.defineParameter(
+    "nodeCount","Number of Nodes",
+    portal.ParameterType.INTEGER,10,
+    longDescription="Number of nodes in your kubernetes cluster.  Should be either 1, or >= 3.  The DSB-SN placement that blueprint-docc-mod/utils/build_deploy_dsb.sh generates by default pins services to node-1..node-9 (node-0 is the tainted control plane), so 10 nodes reproduces the paper setup; on a smaller cluster write your own examples/dsb_sn/node-pinning-<name>.yaml (see the README).  With 'Install Kubernetes' disabled this should be 1.")
+pc.defineParameter(
+    "nodeType","Hardware Type",
+    portal.ParameterType.NODETYPE,"",
+    longDescription="A specific hardware type to use for each node.  Cloudlab clusters all have machines of specific types.  When you set this field to a value that is a specific hardware type, you will only be able to instantiate this profile on clusters with machines of that type.  If unset, when you instantiate the profile, the resulting experiment may have machines of any available type allocated.")
+pc.defineParameter(
+    "linkSpeed","Experiment Link Speed",
+    portal.ParameterType.INTEGER,0,
+    [(0,"Any"),(1000000,"1Gb/s"),(10000000,"10Gb/s"),(25000000,"25Gb/s"),(40000000,"40Gb/s"),(100000000,"100Gb/s")],
+    longDescription="A specific link speed to use for each link/LAN.  All experiment network interfaces will request this speed.")
+pc.defineParameter(
+    "diskImage","Disk Image",
+    portal.ParameterType.STRING,
+    "urn:publicid:IDN+emulab.net+image+emulab-ops//UBUNTU22-64-STD",
+    advanced=True,
+    longDescription="An image URN or URL that every node will run.")
+pc.defineParameter(
+    "multiplexLans", "Multiplex Networks",
+    portal.ParameterType.BOOLEAN,False,
+    longDescription="Multiplex any networks over physical interfaces using VLANs.  Some physical machines have only a single experiment network interface, so if you want multiple links/LANs, you have to enable multiplexing.  Currently, if you select this option.",
+    advanced=True)
 
-# Define the setup command to run your bash script
-# This will create a directory, set ownership, and run your setup script with output logged
-TBCMD = "sudo mkdir -p /local/setup && sudo chown `geni-get user_urn | cut -f4 -d+` /local/setup && sudo -u `geni-get user_urn | cut -f4 -d+` -Hi /bin/bash -c '/local/repository/my-setup-script.sh >/local/setup/setup.log 2>&1'"
+#
+# Bridges stack.
+#
+pc.defineParameter(
+    "installKubernetes","Install Kubernetes",
+    portal.ParameterType.BOOLEAN,True,
+    longDescription="Install a Kubernetes cluster with Kubespray (the normal multi-node deployment path: DSB-SN is deployed with blueprint-docc-mod/utils/build_deploy_dsb.sh via kompose).  Deselect to get a plain single-node Docker host (docker-ce + compose plugin) with the same repos and toolchain, for docker-compose-only Blueprint work.")
+pc.defineParameter(
+    "repoDir","Repository Directory",
+    portal.ParameterType.STRING,"",
+    longDescription="Directory on node-0 under which the four repositories are cloned (blueprint-docc-mod, opentelemetry-collector-contrib, bridges, DeathStarBench side by side, as the fork's scripts expect).  Empty means the experiment creator's home directory (/users/<you>).")
+pc.defineParameter(
+    "blueprintRepo","Blueprint Repository",
+    portal.ParameterType.STRING,"https://github.com/docc-lab/blueprint-docc-mod.git",
+    longDescription="Git URL of the Blueprint fork.  Must be publicly cloneable (no credentials are available on the nodes).")
+pc.defineParameter(
+    "blueprintBranch","Blueprint Branch",
+    portal.ParameterType.STRING,"retctx-reject-impl",
+    longDescription="Branch, tag or commit of the Blueprint fork to check out.  retctx-reject-impl carries the bridge SDK, the DSB-SN wiring specs, d2k8s and the k8s deployment scripts.")
+pc.defineParameter(
+    "collectorRepo","Collector Repository",
+    portal.ParameterType.STRING,"https://github.com/docc-lab/opentelemetry-collector-contrib.git",
+    longDescription="Git URL of the OpenTelemetry collector fork (priorityprocessor, configdiscoveryreceiver).")
+pc.defineParameter(
+    "collectorBranch","Collector Branch",
+    portal.ParameterType.STRING,"retctx-reject-impl",
+    longDescription="Branch, tag or commit of the collector fork to check out.")
+pc.defineParameter(
+    "bridgesRepo","Bridges Repository",
+    portal.ParameterType.STRING,"https://github.com/docc-lab/bridges.git",
+    longDescription="Git URL of the bridges repository (offline trace reconstruction, simulators, analysis).")
+pc.defineParameter(
+    "bridgesBranch","Bridges Branch",
+    portal.ParameterType.STRING,"main",
+    longDescription="Branch, tag or commit of the bridges repository to check out.")
+pc.defineParameter(
+    "dsbRepo","DeathStarBench Repository",
+    portal.ParameterType.STRING,"https://github.com/docc-lab/DeathStarBench.git",
+    longDescription="Git URL of DeathStarBench (cloned with submodules; provides wrk2 and the social-network seeder data).")
+pc.defineParameter(
+    "dsbBranch","DeathStarBench Branch",
+    portal.ParameterType.STRING,"",
+    longDescription="Branch, tag or commit of DeathStarBench to check out; empty uses the repository default branch.")
+pc.defineParameter(
+    "goVersion","Go Version",
+    portal.ParameterType.STRING,"1.26.4",
+    longDescription="Go toolchain version installed to /usr/local/go from go.dev (bare version, e.g. 1.26.4).  Must satisfy every repo's go.mod: bridges needs >= 1.25.2, the collector >= 1.24, Blueprint >= 1.23.6.",
+    advanced=True)
+pc.defineParameter(
+    "komposeVersion","kompose Version",
+    portal.ParameterType.STRING,"v1.38.0",
+    longDescription="kompose release tag downloaded from GitHub (used by d2k8s to turn Blueprint's docker-compose output into Kubernetes manifests).",
+    advanced=True)
+pc.defineParameter(
+    "buildCollector","Build Collector",
+    portal.ParameterType.BOOLEAN,True,
+    longDescription="Build the collector fork's otelcontribcol binary during setup; with Kubernetes this also builds the Docker image and pushes it to the in-cluster registry (10.10.1.1:30000) so build_deploy_dsb.sh can deploy immediately.  Adds roughly 10-15 minutes.  build_deploy_dsb.sh --build-collector redoes this at any time.")
+pc.defineParameter(
+    "bridgesPython","Bridges Python Environment",
+    portal.ParameterType.BOOLEAN,True,
+    longDescription="Create bridges/.venv with the analysis requirements (numpy, pandas, scipy, matplotlib, seaborn) from requirements-local.txt.")
+pc.defineParameter(
+    "installOrTools","Install OR-Tools (cpsat)",
+    portal.ParameterType.BOOLEAN,False,
+    longDescription="Download the prebuilt Google OR-Tools C++ release into the repository directory and build the bridges `cpsat` build-tag binaries against it (trace_recon with CP-SAT).  Off by default; the plain bridges binaries build without it.",
+    advanced=True)
+pc.defineParameter(
+    "orToolsVersion","OR-Tools Version",
+    portal.ParameterType.STRING,"v9.15/or-tools_amd64_ubuntu-22.04_cpp_v9.15.6755.tar.gz",
+    longDescription="GitHub release path (tag/asset) of the prebuilt OR-Tools tarball used when 'Install OR-Tools' is enabled.",
+    advanced=True)
+pc.defineParameter(
+    "cpuPinGhz","Pin CPU Clock (GHz)",
+    portal.ParameterType.STRING,"0",
+    longDescription="If non-zero, pin every node's CPUs to this clock with blueprint-docc-mod/utils/pin-cpu-22ghz.sh at the end of setup (2.2 matches the bridges paper).  Not persistent across reboots.  0 disables.",
+    advanced=True)
 
-# Variable number of nodes.
-pc.defineParameter("nodeCount", "Number of Nodes", portal.ParameterType.INTEGER, 1,
-                   longDescription="If you specify more then one node, " +
-                   "we will create a lan for you.")
+#
+# Kubespray / kubernetes knobs (stock k8s-profile).
+#
+pc.defineParameter(
+    "kubesprayRepo","Kubespray Git Repository",
+    portal.ParameterType.STRING,
+    "https://github.com/kubernetes-incubator/kubespray.git",
+    longDescription="Do not change this value unless you know what you are doing!  Changing would only be necessary if you have a modified fork of Kubespray.  This must be a publicly-accessible repository.",
+    advanced=True)
+pc.defineParameter(
+    "kubesprayVersion","Kubespray Version",
+    portal.ParameterType.STRING,"release-2.25",
+    longDescription="A tag or commit-ish value; we will run `git checkout <value>`.  The default value is the most recent stable value we have tested.  You should only change this if you need a new feature only available on `master`, or an old feature from a prior release.  We support versions back to release-2.13 only.  Ubuntu 22 supports only release-2.20 and greater.  You will need to use Ubuntu 20 for anything prior to that.  release-2.26 drops support for Ubuntu 18.",
+    advanced=True)
+pc.defineParameter(
+    "kubesprayUseVirtualenv","Kubespray VirtualEnv",
+    portal.ParameterType.BOOLEAN,True,
+    longDescription="Select if you want Ansible installed in a python virtualenv; deselect to use the system-packaged Ansible.",
+    advanced=True)
+pc.defineParameter(
+    "kubeVersion","Kubernetes Version",
+    portal.ParameterType.STRING,"",
+    longDescription="A specific release of Kubernetes to install (e.g. v1.16.3); if left empty, Kubespray will choose its current stable version and install that.  You can check for Kubespray-known releases at https://github.com/kubernetes-sigs/kubespray/blob/release-2.16/roles/download/defaults/main.yml (or if you're using a different Kubespray release, choose the corresponding feature release branch in that URL).  You can use unsupported or unknown versions, however, as long as the binaries actually exist.",
+    advanced=True)
+pc.defineParameter(
+    "helmVersion","Helm Version",
+    portal.ParameterType.STRING,"",
+    longDescription="A specific release of Helm to install (e.g. v2.12.3); if left empty, Kubespray will choose its current stable version and install that.  Note that the version you pick must exist as a tag in this Docker image repository: https://hub.docker.com/r/lachlanevenson/k8s-helm/tags .",
+    advanced=True)
+pc.defineParameter(
+    "containerManager","Container Manager",
+    portal.ParameterType.STRING,"docker",
+    [("docker","docker"),("containerd","containerd")],
+    longDescription="The container manager to use; either docker or containerd.  Keep docker: the bridges build scripts build and push images with the docker CLI on node-0.",
+    advanced=True)
+pc.defineParameter(
+    "dockerVersion","Docker Version",
+    portal.ParameterType.STRING,"",
+    longDescription="A specific Docker version to install; if left empty, Kubespray will choose its current stable version and install that.  As explained in the Kubespray documentation (https://github.com/kubernetes-sigs/kubespray/blob/master/docs/vars.md), this value must be one of those listed at, e.g. https://github.com/kubernetes-sigs/kubespray/blob/release-2.20/roles/container-engine/docker/vars/ubuntu.yml .",
+    advanced=True)
+pc.defineParameter(
+    "dockerOptions","Dockerd Options",
+    portal.ParameterType.STRING,"",
+    longDescription="Extra command-line options to pass to dockerd.  The most common option is probably an --insecure-registry .",
+    advanced=True)
+pc.defineParameter(
+    "doLocalRegistry","Create Private, Local Registry",
+    portal.ParameterType.BOOLEAN,True,
+    longDescription="Create a private Docker registry on the kube master, and expose it on the (private) management IP address, port 5000, and configure Kubernetes to be able to use it (--insecure-registry).  This is nearly mandatory for some development workflows, so it is on by default.  Keep it on: it is what marks 10.10.1.0/24 (and so the in-cluster registry at 10.10.1.1:30000 used by build_deploy_dsb.sh) as an insecure registry on every node.",
+    advanced=True)
+pc.defineParameter(
+    "kubeNetworkPlugin","Kubernetes Network Plugin",
+    portal.ParameterType.STRING,"calico",
+    [("calico","Calico"),("flannel","Flannel"),("weave","Weave")],
+    longDescription="Choose the primary kubernetes network plugin.",
+    advanced=True)
+pc.defineParameter(
+    "kubeEnableMultus","Enable Multus Network Meta Plugin",
+    portal.ParameterType.BOOLEAN,False,
+    longDescription="Select to enable the Multus (https://github.com/kubernetes-sigs/kubespray/blob/master/docs/multus.md) CNI meta plugin.  Multus provides multiple network interface support to pods.",
+    advanced=True)
+pc.defineParameter(
+    "kubeProxyMode","Kube Proxy Mode",
+    portal.ParameterType.STRING,"ipvs",
+    [("iptables","iptables"),("ipvs","ipvs")],
+    longDescription="Choose the mode for kube-proxy (comparison: https://www.projectcalico.org/comparing-kube-proxy-modes-iptables-or-ipvs/).",
+    advanced=True)
+pc.defineParameter(
+    "kubePodsSubnet","Kubernetes Pods Subnet",
+    portal.ParameterType.STRING,"192.168.0.0/17",
+    longDescription="The subnet containing pod addresses.",
+    advanced=True)
+pc.defineParameter(
+    "kubeServiceAddresses","Kubernetes Service Addresses",
+    portal.ParameterType.STRING,"192.168.128.0/17",
+    longDescription="The subnet containing service addresses.",
+    advanced=True)
+pc.defineParameter(
+    "kubeDoMetalLB","Kubespray Enable MetalLB",
+    portal.ParameterType.BOOLEAN,True,
+    longDescription="We enable MetalLB by default, so that users can use an \"external\" load balancer service type.  You need at least one public IP address for this option because it doesn't make sense without one.",
+    advanced=True)
+pc.defineParameter(
+    "publicIPCount", "Number of public IP addresses",
+    portal.ParameterType.INTEGER,1,
+    longDescription="Set the number of public IP addresses you will need for externally-published services (e.g., via a load balancer like MetalLB.",
+    advanced=True)
+pc.defineParameter(
+    "kubeFeatureGates","Kubernetes Feature Gate List",
+    portal.ParameterType.STRING,"",
+    longDescription="A []-enclosed, comma-separated list of features.  For instance, `[SCTPSupport=true]`.",
+    advanced=True)
+pc.defineParameter(
+    "kubeletCustomFlags","Kubelet Custom Flags List",
+    portal.ParameterType.STRING,"",
+    longDescription="A []-enclosed, comma-separated list of flags.  For instance, `[--allowed-unsafe-sysctls=net.*]`.",
+    advanced=True)
+pc.defineParameter(
+    "kubeletMaxPods","Kubelet Max Pods",
+    portal.ParameterType.INTEGER,0,
+    longDescription="An integer max pods limit; 0 allows Kubernetes to use its default value (currently is 110; see https://kubespray.io/#/docs/vars and look for `kubelet_max_pods`).  Do not change this unless you know what you are doing.",
+    advanced=True)
+pc.defineParameter(
+    "kubeAllWorkers","Kube Master is Worker",
+    portal.ParameterType.BOOLEAN,False,
+    longDescription="Allow the kube master to be a worker in the multi-node case (always true for single-node clusters); disabled by default.",
+    advanced=True)
+pc.defineParameter(
+    "sslCertType","SSL Certificate Type",
+    portal.ParameterType.STRING,"self",
+    [("none","None"),("self","Self-Signed"),("letsencrypt","Let's Encrypt")],
+    advanced=True,
+    longDescription="Choose an SSL Certificate strategy.  By default, we generate self-signed certificates, and only use them for a reverse web proxy to allow secure remote access to the Kubernetes Dashboard.  However, you may choose `None` if you prefer to arrange remote access differently (e.g. ssh port forwarding).  You may also choose to use Let's Encrypt certificates whose trust root is accepted by all modern browsers.")
+pc.defineParameter(
+    "sslCertConfig","SSL Certificate Configuration",
+    portal.ParameterType.STRING,"proxy",
+    [("proxy","Web Proxy")],
+    advanced=True,
+    longDescription="Choose where you want the SSL certificates deployed.  Currently the only option is for them to be configured as part of the web proxy to the dashboard.")
+pc.defineParameter(
+    "doNFS","Enable NFS",
+    portal.ParameterType.BOOLEAN,True,
+    longDescription="We enable NFS by default, to be used by persistent volumes in Kubernetes services.  Keep it on: the in-cluster image registry's PVC uses the nfs-client storage class.",
+    advanced=True)
+pc.defineParameter(
+    "nfsAsync","Export NFS volume async",
+    portal.ParameterType.BOOLEAN,False,
+    longDescription="Force the default NFS volume to be exported `async`.  When enabled, clients will only be given asynchronous write behavior even if they request sync or write with sync flags.  This is dangerous, but some applications that rely on persistent storage cannot be configured to use more helpful sync options (e.g., fsync instead of O_DIRECT).  It will give you the absolute best performance, however.",
+    advanced=True)
+pc.defineStructParameter(
+    "sharedVlans","Add Shared VLAN",[],
+    multiValue=True,itemDefaultValue={},min=0,max=None,
+    members=[
+        portal.Parameter(
+            "createConnectableSharedVlan","Create Connectable Shared VLAN",
+            portal.ParameterType.BOOLEAN,False,
+            longDescription="Create a placeholder, connectable shared VLAN stub and 'attach' the first node to it.  You can use this during the experiment to connect this experiment interface to another experiment's shared VLAN."),
+        portal.Parameter(
+            "createSharedVlan","Create Shared VLAN",
+            portal.ParameterType.BOOLEAN,False,
+            longDescription="Create a new shared VLAN with the name above, and connect the first node to it."),
+        portal.Parameter(
+            "connectSharedVlan","Connect to Shared VLAN",
+            portal.ParameterType.BOOLEAN,False,
+            longDescription="Connect an existing shared VLAN with the name below to the first node."),
+        portal.Parameter(
+            "sharedVlanName","Shared VLAN Name",
+            portal.ParameterType.STRING,"",
+            longDescription="A shared VLAN name (functions as a private key allowing other experiments to connect to this node/VLAN), used when the 'Create Shared VLAN' or 'Connect to Shared VLAN' options above are selected.  Must be fewer than 32 alphanumeric characters."),
+        portal.Parameter(
+            "sharedVlanAddress","Shared VLAN IP Address",
+            portal.ParameterType.STRING,"10.254.254.1",
+            longDescription="Set the IP address for the shared VLAN interface.  Make sure to use an unused address within the subnet of an existing shared vlan!"),
+        portal.Parameter(
+            "sharedVlanNetmask","Shared VLAN Netmask",
+            portal.ParameterType.STRING,"255.255.255.0",
+            longDescription="Set the subnet mask for the shared VLAN interface, as a dotted quad.")])
+pc.defineStructParameter(
+    "datasets","Datasets",[],
+    multiValue=True,itemDefaultValue={},min=0,max=None,
+    members=[
+        portal.Parameter(
+            "urn","Dataset URN",
+            portal.ParameterType.STRING,"",
+            longDescription="The URN of an *existing* remote dataset (a remote block store) that you want attached to the node you specified (defaults to the first node).  The block store must exist at the cluster at which you instantiate the profile."),
+        portal.Parameter(
+            "mountNode","Dataset Mount Node",
+            portal.ParameterType.STRING,"node-0",
+            longDescription="The node on which you want your remote block store mounted; defaults to the first node."),
+        portal.Parameter(
+            "mountPoint","Dataset Mount Point",
+            portal.ParameterType.STRING,"/dataset",
+            longDescription="The mount point at which you want your remote dataset mounted.  Be careful where you mount it -- something might already be there (i.e., /storage is already taken).  Note also that this option requires a network interface, because it creates a link between the dataset and the node where the dataset is available.  Thus, just as for creating extra LANs, you might need to select the Multiplex Flat Networks option, which will also multiplex the blockstore link here."),
+        portal.Parameter(
+            "mode","Dataset Mount Mode (R/O, RW clone, persistent RW)",
+            portal.ParameterType.STRING, "readonly", [("readonly", "Read Only"),("rwclone","Read/Write Clone"),("rwpersist","Persistent Read/Write")],
+            longDescription="Mode to mount the dataset with. Readonly is the default. RW clone allows for read/write, but the changes do not persist after experiment termination. Persistent RW causes changes to persist beyond the experiment.")])
 
-# Pick your OS.
-imageList = [
-    ('default', 'Default Image'),
-    ('urn:publicid:IDN+emulab.net+image+emulab-ops//UBUNTU22-64-STD', 'UBUNTU 22.04'),
-    ('urn:publicid:IDN+emulab.net+image+emulab-ops//UBUNTU20-64-STD', 'UBUNTU 20.04'),
-    ('urn:publicid:IDN+emulab.net+image+emulab-ops//UBUNTU18-64-STD', 'UBUNTU 18.04'),
-    ('urn:publicid:IDN+emulab.net+image+emulab-ops//CENTOS8S-64-STD',  'CENTOS 8 Stream'),
-    ('urn:publicid:IDN+emulab.net+image+emulab-ops//FBSD123-64-STD', 'FreeBSD 12.3'),
-    ('urn:publicid:IDN+emulab.net+image+emulab-ops//FBSD131-64-STD', 'FreeBSD 13.1')]
-
-pc.defineParameter("osImage", "Select OS image",
-                   portal.ParameterType.IMAGE,
-                   imageList[0], imageList,
-                   longDescription="Most clusters have this set of images, " +
-                   "pick your favorite one.")
-
-# Optional physical type for all nodes.
-pc.defineParameter("phystype",  "Optional physical node type",
-                   portal.ParameterType.STRING, "c220g1",
-                   longDescription="Specify a single physical node type (pc3000,d710,etc) " +
-                   "instead of letting the resource mapper choose for you.")
-
-# Optionally create XEN VMs instead of allocating bare metal nodes.
-pc.defineParameter("useVMs",  "Use XEN VMs",
-                   portal.ParameterType.BOOLEAN, False,
-                   longDescription="Create XEN VMs instead of allocating bare metal nodes.")
-
-# Optionally start X11 VNC server.
-pc.defineParameter("startVNC",  "Start X11 VNC on your nodes",
-                   portal.ParameterType.BOOLEAN, False,
-                   longDescription="Start X11 VNC server on your nodes. There will be " +
-                   "a menu option in the node context menu to start a browser based VNC " +
-                   "client. Works really well, give it a try!")
-
-
-
-# Optional link speed, normally the resource mapper will choose for you based on node availability
-pc.defineParameter("linkSpeed", "Link Speed",portal.ParameterType.INTEGER, 0,
-                   [(0,"Any"),(100000,"100Mb/s"),(1000000,"1Gb/s"),(10000000,"10Gb/s"),(25000000,"25Gb/s"),(100000000,"100Gb/s")],
-                   advanced=True,
-                   longDescription="A specific link speed to use for your lan. Normally the resource " +
-                   "mapper will choose for you based on node availability and the optional physical type.")
-                   
-# For very large lans you might to tell the resource mapper to override the bandwidth constraints
-# and treat it a "best-effort"
-pc.defineParameter("bestEffort",  "Best Effort", portal.ParameterType.BOOLEAN, False,
-                    advanced=True,
-                    longDescription="For very large lans, you might get an error saying 'not enough bandwidth.' " +
-                    "This options tells the resource mapper to ignore bandwidth and assume you know what you " +
-                    "are doing, just give me the lan I ask for (if enough nodes are available).")
-                    
-# Sometimes you want all of nodes on the same switch, Note that this option can make it impossible
-# for your experiment to map.
-pc.defineParameter("sameSwitch",  "No Interswitch Links", portal.ParameterType.BOOLEAN, False,
-                    advanced=True,
-                    longDescription="Sometimes you want all the nodes connected to the same switch. " +
-                    "This option will ask the resource mapper to do that, although it might make " +
-                    "it imppossible to find a solution. Do not use this unless you are sure you need it!")
-
-# Optional ephemeral blockstore
-pc.defineParameter("tempFileSystemSize", "Temporary Filesystem Size",
-                   portal.ParameterType.INTEGER, 0,advanced=True,
-                   longDescription="The size in GB of a temporary file system to mount on each of your " +
-                   "nodes. Temporary means that they are deleted when your experiment is terminated. " +
-                   "The images provided by the system have small root partitions, so use this option " +
-                   "if you expect you will need more space to build your software packages or store " +
-                   "temporary files.")
-                   
-# Instead of a size, ask for all available space. 
-pc.defineParameter("tempFileSystemMax",  "Temp Filesystem Max Space",
-                    portal.ParameterType.BOOLEAN, False,
-                    advanced=True,
-                    longDescription="Instead of specifying a size for your temporary filesystem, " +
-                    "check this box to allocate all available disk space. Leave the size above as zero.")
-
-pc.defineParameter("tempFileSystemMount", "Temporary Filesystem Mount Point",
-                   portal.ParameterType.STRING,"/mydata",advanced=True,
-                   longDescription="Mount the temporary file system at this mount point; in general you " +
-                   "you do not need to change this, but we provide the option just in case your software " +
-                   "is finicky.")
-
-# Retrieve the values the user specifies during instantiation.
+#
+# Get any input parameter values that will override our defaults.
+#
 params = pc.bindParameters()
 
-# Check parameter validity.
-if params.nodeCount < 1:
-    pc.reportError(portal.ParameterError("You must choose at least 1 node.", ["nodeCount"]))
+if params.publicIPCount > 8:
+    perr = portal.ParameterWarning(
+        "You cannot request more than 8 public IP addresses, at least not without creating your own modified version of this profile!",
+        ["publicIPCount"])
+    pc.reportWarning(perr)
+if params.installKubernetes and params.kubeDoMetalLB and params.publicIPCount < 1:
+    perr = portal.ParameterWarning(
+        "If you enable MetalLB, you must request at least one public IP address!",
+        ["kubeDoMetalLB","publicIPCount"])
+    pc.reportWarning(perr)
+if not params.installKubernetes and params.nodeCount > 1:
+    perr = portal.ParameterWarning(
+        "Without Kubernetes only node-0 is set up (docker + repos); the other nodes get ssh keys and extra disk space but nothing else.",
+        ["installKubernetes","nodeCount"])
+    pc.reportWarning(perr)
+if params.installKubernetes and params.containerManager != "docker":
+    perr = portal.ParameterWarning(
+        "The bridges build scripts use the docker CLI on node-0 to build and push images; containerd-only nodes will need docker installed by hand.",
+        ["containerManager"])
+    pc.reportWarning(perr)
+if params.installKubernetes and not params.doNFS:
+    perr = portal.ParameterWarning(
+        "The in-cluster image registry (blueprint-docc-mod/utils/registry-pvc.yaml) needs the nfs-client storage class; without NFS it will stay Pending and the collector image push will fail.",
+        ["doNFS"])
+    pc.reportWarning(perr)
+for (pname,pval) in [("blueprintRepo",params.blueprintRepo),("collectorRepo",params.collectorRepo),("bridgesRepo",params.bridgesRepo),("dsbRepo",params.dsbRepo)]:
+    if not pval:
+        pc.reportError(portal.ParameterError("Repository URL must not be empty",[pname]))
+try:
+    float(params.cpuPinGhz)
+except:
+    pc.reportError(portal.ParameterError("Must be a number (0 disables)",["cpuPinGhz"]))
+i = 0
+for x in params.sharedVlans:
+    n = 0
+    if x.createConnectableSharedVlan:
+        n += 1
+    if x.createSharedVlan:
+        n += 1
+    if x.connectSharedVlan:
+        n += 1
+    if n > 1:
+        err = portal.ParameterError(
+            "Must choose only a single shared vlan operation (create, connect, create connectable)",
+        [ 'sharedVlans[%d].createConnectableSharedVlan' % (i,),
+          'sharedVlans[%d].createSharedVlan' % (i,),
+          'sharedVlans[%d].connectSharedVlan' % (i,) ])
+        pc.reportError(err)
+    if n == 0:
+        err = portal.ParameterError(
+            "Must choose one of the shared vlan operations: create, connect, create connectable",
+        [ 'sharedVlans[%d].createConnectableSharedVlan' % (i,),
+          'sharedVlans[%d].createSharedVlan' % (i,),
+          'sharedVlans[%d].connectSharedVlan' % (i,) ])
+        pc.reportError(err)
+    i += 1
 
-if params.tempFileSystemSize < 0 or params.tempFileSystemSize > 200:
-    pc.reportError(portal.ParameterError("Please specify a size greater then zero and " +
-                                         "less then 200GB", ["tempFileSystemSize"]))
-
-if params.phystype != "":
-    tokens = params.phystype.split(",")
-    if len(tokens) != 1:
-        pc.reportError(portal.ParameterError("Only a single type is allowed", ["phystype"]))
-
+#
+# Give the library a chance to return nice JSON-formatted exception(s) and/or
+# warnings; this might sys.exit().
+#
 pc.verifyParameters()
 
-# Create link/lan.
+#
+# Instruction text.
+#
+bridgesInstructions = \
+  """
+## Waiting for your Experiment to Complete Setup
+
+Once the initial phase of experiment creation completes (disk load and node configuration), the profile's setup scripts begin installing software according to the profile parameters.  Wait until the experiment State changes from "booted (startup services are still running)" to "ready".  You can watch [the setup script logfiles](http://{host-node-0}:7999/) (username `admin`, password `{password-adminPass}`); the main log is `/local/logs/setup.log` on each node, and the bridges part is `/local/logs/setup-bridges.sh.log` on `node-0`.  A setup-complete email is also sent.
+
+## What is set up on node-0
+
+Everything lives under the repository directory (default: your home directory):
+
+  - `blueprint-docc-mod/`  Blueprint fork (branch per the `blueprintBranch` parameter) with `.venv/` (pyyaml, aiohttp) for `d2k8s` and the DSB-SN seeder.
+  - `opentelemetry-collector-contrib/`  collector fork; with `buildCollector` the `otelcontribcol` binary is built and (on Kubernetes) the image is pushed to the in-cluster registry at `10.10.1.1:30000`.
+  - `bridges/`  reconstruction + analysis code, binaries in `bridges/bin/`, optional `.venv/` with the analysis requirements.
+  - `DeathStarBench/`  wrk2 (installed as `/usr/local/bin/wrk`) and the social-network seeder data.
+
+The toolchain (Go, protoc + plugins, kompose, goimports) is on your PATH after a new login, or `source ~/bridges-env.sh` in an existing shell.  `bridges-env.sh` also records which repos/branches/versions were installed.  The hardcoded `/users/tomislav` paths in the fork's `utils/*.sh` helpers are rewritten to your repository directory (the rewrite log is in `/local/setup/bridges-path-rewrite.log`).
+
+## Deploying DSB-SN on the cluster
+
+    source ~/bridges-env.sh
+    source ~/blueprint-docc-mod/.venv/bin/activate
+    cd ~/blueprint-docc-mod
+    utils/build_deploy_dsb.sh -s docker_pb_es -n pb_test --cpd 2 --gc natural --apply --seed
+
+See `utils/build_deploy_dsb.sh -h` and `utils/User_Guide.md` in the fork for the full set of knobs.  Elasticsearch needs `vm.max_map_count=262144`; the profile sets that on every node.
+
+"""
+
+kubeInstructions = \
+  """
+## Kubernetes credentials and dashboard access
+
+Once the profile's scripts have finished configuring software in your experiment, you'll be able to visit [the Kubernetes Dashboard WWW interface](https://{host-node-0}:8080/api/v1/namespaces/kube-system/services/https:kubernetes-dashboard:/proxy/#!/login) (approx. 10-15 minutes for the Kubernetes portion alone).
+
+The easiest login option is to use token authentication.  (Basic auth is configured if available, for older kubernetes versions, username `admin` password `{password-adminPass}`.  You may also supply a kubeconfig file, but we don't provide one that includes a secret by default, so you would have to generate that.)
+
+For `token` authentication: copy the token from http://{host-node-0}:7999/admin-token.txt (username `admin`, password `{password-adminPass}`) (this file is located on `node-0` in `/local/setup/admin-token.txt`).
+
+(To provide secure dashboard access, we run a `kube-proxy` instance that listens on localhost:8888 and accepts all incoming hosts, and export that via nginx proxy listening on `{host-node-0}:8080` (but note that the proxy is restricted by path to the dashboard path only, so you cannot use this more generally).  We also create an `admin` `serviceaccount` in the `default` namespace, and that is the serviceaccount associated with the token auth option mentioned just above.)
+
+Kubernetes credentials are in `~/.kube/config`, or in `/root/.kube/config`, as you'd expect.
+
+## Changing your Kubernetes deployment
+
+The profile's setup scripts are automatically installed on each node in `/local/repository`, and all of the Kubernetes installation is triggered from `node-0`.  The scripts execute as your uid, and keep state and downloaded files in `/local/setup/`.  The scripts write copious logfiles in that directory; so if you think there's a problem with the configuration, you could take a quick look through these logs on the `node-0` node.  The primary logfile is `/local/logs/setup.log`.
+
+Kubespray is a collection of Ansible playbooks, so you can make changes to the deployed kubernetes cluster, or even destroy and rebuild it (although you would then lose any of the post-install configuration we do in `/local/repository/setup-kubernetes-extra.sh`).  The `/local/repository/setup-kubespray.sh` script installs Ansible inside a Python 3 `virtualenv` (in `/local/setup/kubespray-virtualenv` on `node-0`).  A `virtualenv` (or `venv`) is effectively a separate part of the filesystem containing Python libraries and scripts, and a set of environment variables and paths that restrict its user to those Python libraries and scripts.  To modify your cluster's configuration in the Kubespray/Ansible way, you can run commands like these (as your uid):
+
+1. "Enter" (or access) the `virtualenv`: `. /local/setup/kubespray-virtualenv/bin/activate`
+2. Leave (or remove the environment vars from your shell session) the `virtualenv`: `deactivate`
+3. Destroy your entire kubernetes cluster: `ansible-playbook -i /local/setup/inventories/kubernetes/inventory.ini /local/setup/kubespray/remove-node.yml -b -v --extra-vars "node=node-0,node-1,node-2"`
+   (note that you would want to supply the short names of all nodes in your experiment)
+4. Recreate your kubernetes cluster: `ansible-playbook -i /local/setup/inventories/kubernetes/inventory.ini /local/setup/kubespray/cluster.yml -e @/local/setup/inventories/kubernetes/inventory/overrides.yml -b -v`
+
+To change the Ansible and playbook configuration, you can start reading Kubespray documentation:
+  - https://github.com/kubernetes-sigs/kubespray/blob/master/docs/getting-started.md
+  - https://github.com/kubernetes-sigs/kubespray
+  - https://kubespray.io/
+"""
+
+tourDescription = \
+  "Kubernetes cluster (Kubespray, from the Utah k8s-profile) or a single-node Docker host, with the Blueprint bridges stack (docc-lab blueprint-docc-mod, opentelemetry-collector-contrib, bridges, DeathStarBench) cloned, built and ready to deploy DSB-SN on node-0."
+
+if params.installKubernetes:
+    tourInstructions = bridgesInstructions + kubeInstructions
+else:
+    tourInstructions = bridgesInstructions
+
+#
+# Setup the Tour info with the above description and instructions.
+#
+tour = IG.Tour()
+tour.Description(IG.Tour.TEXT,tourDescription)
+tour.Instructions(IG.Tour.MARKDOWN,tourInstructions)
+rspec.addTour(tour)
+
+datalans = []
+
 if params.nodeCount > 1:
-    if params.nodeCount == 2:
-        lan = request.Link()
-    else:
-        lan = request.LAN()
-        pass
-    if params.bestEffort:
-        lan.best_effort = True
-    elif params.linkSpeed > 0:
-        lan.bandwidth = params.linkSpeed
-    if params.sameSwitch:
-        lan.setNoInterSwitchLinks()
-    pass
+    datalan = RSpec.LAN("datalan-1")
+    if params.linkSpeed > 0:
+        datalan.bandwidth = int(params.linkSpeed)
+    if params.multiplexLans:
+        datalan.link_multiplexing = True
+        datalan.best_effort = True
+        # Need this cause LAN() sets the link type to lan, not sure why.
+        datalan.type = "vlan"
+    datalans.append(datalan)
 
-# Process nodes, adding to link or lan.
-for i in range(params.nodeCount):
-    # Create a node and add it to the request
-    if params.useVMs:
-        name = "vm" + str(i)
-        node = request.XenVM(name)
-    else:
-        name = "node" + str(i)
-        node = request.RawPC(name)
-        pass
-    if params.osImage and params.osImage != "default":
-        node.disk_image = params.osImage
-        pass
-    # Add to lan
-    if params.nodeCount > 1:
-        iface = node.addInterface("eth1")
-        lan.addInterface(iface)
-        pass
-    # Optional hardware type.
-    if params.phystype != "":
-        node.hardware_type = params.phystype
-        node.addService(pg.Install(url="https://github.com/docc-lab/blueprint-docc-mod/raw/main/scripts/cloudlab_profile/test.tar.gz", path="/local"))
-        node.addService(pg.Execute(shell="bash", command="/local/setup-dependency.sh"))
-        pass
-    
-    # Add the custom setup script execution
+nodes = dict({})
+
+sharedvlans = []
+for i in range(0,params.nodeCount):
+    nodename = "node-%d" % (i,)
+    node = RSpec.RawPC(nodename)
+    if params.nodeType:
+        node.hardware_type = params.nodeType
+    if params.diskImage:
+        node.disk_image = params.diskImage
+    j = 0
+    for datalan in datalans:
+        iface = node.addInterface("if%d" % (j,))
+        datalan.addInterface(iface)
+        j += 1
     if TBCMD is not None:
-        node.addService(pg.Execute(shell="sh", command=TBCMD))
-    
-    # Optional Blockstore
-    if params.tempFileSystemSize > 0 or params.tempFileSystemMax:
-        bs = node.Blockstore(name + "-bs", params.tempFileSystemMount)
-        if params.tempFileSystemMax:
-            bs.size = "0GB"
-        else:
-            bs.size = str(params.tempFileSystemSize) + "GB"
-            pass
-        bs.placement = "any"
-        pass
-    #
-    # Install and start X11 VNC. Calling this informs the Portal that you want a VNC
-    # option in the node context menu to create a browser VNC client.
-    #
-    # If you prefer to start the VNC server yourself (on port 5901) then add nostart=True. 
-    #
-    if params.startVNC:
-        node.startVNC()
-        pass
-    pass
+        node.addService(RSpec.Execute(shell="sh",command=TBCMD))
+    if disableTestbedRootKeys:
+        node.installRootKeys(False, False)
+    nodes[nodename] = node
+    if i == 0:
+        k = 0
+        for x in params.sharedVlans:
+            iface = node.addInterface("ifSharedVlan%d" % (k,))
+            if x.sharedVlanAddress:
+                iface.addAddress(
+                    RSpec.IPv4Address(x.sharedVlanAddress,x.sharedVlanNetmask))
+            sharedvlan = RSpec.Link('shared-vlan-%d' % (k,))
+            sharedvlan.addInterface(iface)
+            if x.createConnectableSharedVlan:
+                sharedvlan.enableSharedVlan()
+            else:
+                if x.createSharedVlan:
+                    svn = x.sharedVlanName
+                    if not svn:
+                        # Create a random name
+                        svn = "sv-" + str(hashlib.sha256(os.urandom(128)).hexdigest()[:28])
+                    sharedvlan.createSharedVlan(svn)
+                else:
+                    sharedvlan.connectSharedVlan(x.sharedVlanName)
+            if params.multiplexLans:
+                sharedvlan.link_multiplexing = True
+                sharedvlan.best_effort = True
+            sharedvlans.append(sharedvlan)
+            k += 1
 
-# Print the RSpec to standard output
-pc.printRequestRSpec(request)
+#
+# Add the dataset(s), if requested.
+#
+bsnodes = []
+bslinks = []
+i = 0
+for x in params.datasets:
+    if not x.urn:
+        err = portal.ParameterError(
+            "Must provide a non-null dataset URN",
+            [ 'datasets[%d].urn' % (i,) ])
+        pc.reportError(err)
+        pc.verifyParameters()
+    if x.mountNode not in nodes:
+        perr = portal.ParameterError(
+            "The node on which you mount your dataset must exist, and does not.",
+            [ 'datasets[%d].mountNode' % (i,) ])
+        pc.reportError(perr)
+        pc.verifyParameters()
+    bsn = nodes[x.mountNode]
+    myintf = bsn.addInterface("ifbs%d" % (i,))
+    bsnode = IG.RemoteBlockstore("bsnode-%d" % (i,),x.mountPoint)
+    bsintf = bsnode.interface
+    bsnode.dataset = x.urn
+    if x.mode == "readonly":
+        bsnode.readonly = True
+    elif x.mode == "rwclone":
+        bsnode.rwclone = True
+    bsnodes.append(bsnode)
+
+    bslink = RSpec.Link("bslink-%d" % (i,))
+    bslink.addInterface(myintf)
+    bslink.addInterface(bsintf)
+    bslink.best_effort = True
+    bslink.vlan_tagging = True
+    bslinks.append(bslink)
+
+for nname in nodes.keys():
+    rspec.addResource(nodes[nname])
+for datalan in datalans:
+    rspec.addResource(datalan)
+for x in sharedvlans:
+    rspec.addResource(x)
+for x in bsnodes:
+    rspec.addResource(x)
+for x in bslinks:
+    rspec.addResource(x)
+
+class EmulabEncrypt(RSpec.Resource):
+    def _write(self, root):
+        ns = "{http://www.protogeni.net/resources/rspec/ext/emulab/1}"
+        el = ET.SubElement(root,"%spassword" % (ns,),attrib={'name':'adminPass'})
+
+adminPassResource = EmulabEncrypt()
+rspec.addResource(adminPassResource)
+
+#
+# Grab a few public IP addresses.
+#
+apool = IG.AddressPool("node-0",params.publicIPCount)
+rspec.addResource(apool)
+
+pc.printRequestRSpec(rspec)
