@@ -51,7 +51,7 @@ pc = portal.Context()
 pc.defineParameter(
     "nodeCount","Number of Nodes",
     portal.ParameterType.INTEGER,10,
-    longDescription="Number of nodes in your kubernetes cluster.  Should be either 1, or >= 3.  The DSB-SN placement that blueprint-docc-mod/utils/build_deploy_dsb.sh generates by default pins services to node-1..node-9 (node-0 is the tainted control plane), so 10 nodes reproduces the paper setup; on a smaller cluster write your own examples/dsb_sn/node-pinning-<name>.yaml (see the README).  With 'Install Kubernetes' disabled this should be 1.")
+    longDescription="Number of nodes in your kubernetes cluster.  Should be either 1, or >= 3.  The DSB-SN placement that blueprint-docc-mod/utils/build_deploy_dsb.sh generates by default pins services to node-1..node-9 (node-0 is the tainted control plane), so 10 nodes reproduces the paper setup; on a smaller cluster the deploy stage folds that placement onto the nodes that exist.  With 'Install Kubernetes' disabled this should be 1.")
 pc.defineParameter(
     "nodeType","Hardware Type",
     portal.ParameterType.NODETYPE,"",
@@ -148,6 +148,42 @@ pc.defineParameter(
     "cpuPinGhz","Pin CPU Clock (GHz)",
     portal.ParameterType.STRING,"0",
     longDescription="If non-zero, pin every node's CPUs to this clock with blueprint-docc-mod/utils/pin-cpu-22ghz.sh at the end of setup (2.2 matches the bridges paper).  Not persistent across reboots.  0 disables.",
+    advanced=True)
+
+pc.defineParameter(
+    "deployApp","Deploy Bridged DSB-SN",
+    portal.ParameterType.BOOLEAN,True,
+    longDescription="Finish setup by building, deploying and seeding the bridge-instrumented DeathStarBench Social Network with utils/build_deploy_dsb.sh, then checking that pods are healthy, load is accepted and traces reach Jaeger.  A failed check fails the setup.  Adds roughly 15 minutes.  Requires Kubernetes.")
+pc.defineParameter(
+    "deploySpec","Bridge Variant",
+    portal.ParameterType.STRING,"docker_pb_es",
+    [("docker_pb_es","Path Bridge"),("docker_cgpb_es","Call-Graph Path Bridge"),("docker_sb_es","Sequence Bridge"),("docker_rc_es","Random-checkpoint control"),("docker_v_es","Vanilla (no bridge)")],
+    longDescription="The DSB-SN wiring spec to deploy.  build_deploy_dsb.sh can replace it with another variant at any time.")
+pc.defineParameter(
+    "deployName","Deployment Build Name",
+    portal.ParameterType.STRING,"profile",
+    longDescription="Build directory (examples/dsb_sn/build_<name>) and placement file (examples/dsb_sn/node-pinning-<name>.yaml) of the deployment.",
+    advanced=True)
+pc.defineParameter(
+    "deployCpd","Checkpoint Distance",
+    portal.ParameterType.INTEGER,2,
+    longDescription="build_deploy_dsb.sh --cpd: the checkpoint distance baked into the collector configuration.",
+    advanced=True)
+pc.defineParameter(
+    "deployGc","Application GC Mode",
+    portal.ParameterType.STRING,"natural",
+    [("natural","natural (GOGC=100)"),("forced","forced (GOGC=off, 10 per second)")],
+    longDescription="build_deploy_dsb.sh --gc.",
+    advanced=True)
+pc.defineParameter(
+    "deploySeed","Seed Social Graph",
+    portal.ParameterType.BOOLEAN,True,
+    longDescription="Seed the social graph after deploying.  The load and trace checks need it, so they are skipped when this is off.",
+    advanced=True)
+pc.defineParameter(
+    "deployPinRequests","Pin CPU Requests",
+    portal.ParameterType.BOOLEAN,False,
+    longDescription="Keep the canonical placement's CPU requests and limits (node-1..node-9 layout only; it needs roughly 40-core nodes).  Off places services without reserving cores.  Requests are always left out when the placement is folded onto fewer than nine schedulable nodes.",
     advanced=True)
 
 #
@@ -348,6 +384,16 @@ if not params.installKubernetes and params.nodeCount > 1:
         "Without Kubernetes only node-0 is set up (docker + repos); the other nodes get ssh keys and extra disk space but nothing else.",
         ["installKubernetes","nodeCount"])
     pc.reportWarning(perr)
+if params.deployApp and not params.installKubernetes:
+    perr = portal.ParameterWarning(
+        "The bridged DSB-SN deployment runs on Kubernetes, so it is skipped when Kubernetes is disabled.",
+        ["deployApp","installKubernetes"])
+    pc.reportWarning(perr)
+if params.deployApp and params.installKubernetes and params.nodeCount < 10:
+    perr = portal.ParameterWarning(
+        "The canonical DSB-SN placement needs node-1..node-9.  With fewer nodes the services are folded onto the available nodes without CPU requests, which differs from the paper setup.",
+        ["deployApp","nodeCount"])
+    pc.reportWarning(perr)
 if params.installKubernetes and params.containerManager != "docker":
     perr = portal.ParameterWarning(
         "The bridges build scripts use the docker CLI on node-0 to build and push images; containerd-only nodes will need docker installed by hand.",
@@ -403,7 +449,7 @@ bridgesInstructions = \
   """
 ## Waiting for your Experiment to Complete Setup
 
-Once the initial phase of experiment creation completes (disk load and node configuration), the profile's setup scripts begin installing software according to the profile parameters.  Wait until the experiment State changes from "booted (startup services are still running)" to "ready".  You can watch [the setup script logfiles](http://{host-node-0}:7999/) (username `admin`, password `{password-adminPass}`); the main log is `/local/logs/setup.log` on each node, and the bridges part is `/local/logs/setup-bridges.sh.log` on `node-0`.  A setup-complete email is also sent.
+Once the initial phase of experiment creation completes (disk load and node configuration), the profile's setup scripts begin installing software according to the profile parameters.  Wait until the experiment State changes from "booted (startup services are still running)" to "ready".  You can watch [the setup script logfiles](http://{host-node-0}:7999/) (username `admin`, password `{password-adminPass}`); the main log is `/local/logs/setup.log` on each node, and the bridges parts are `/local/logs/setup-bridges.sh.log` and `/local/logs/setup-deploy-bridges.sh.log` on `node-0`.  A setup-complete email is also sent.
 
 ## What is set up on node-0
 
@@ -416,12 +462,17 @@ Everything lives under the repository directory (default: your home directory):
 
 The toolchain (Go, protoc + plugins, kompose, goimports) is on your PATH after a new login, or `source ~/bridges-env.sh` in an existing shell.  `bridges-env.sh` also records which repos/branches/versions were installed.  The hardcoded `/users/tomislav` paths in the fork's `utils/*.sh` helpers are rewritten to your repository directory (the rewrite log is in `/local/setup/bridges-path-rewrite.log`).
 
-## Deploying DSB-SN on the cluster
+## The deployed application
 
-    source ~/bridges-env.sh
+With `deployApp` on (the default), a "ready" experiment already runs the seeded, bridge-instrumented DSB-SN: `/local/setup/bridges-deployment.txt` records the variant, the wrk2api URL and the check results, and `~/bridges-env.sh` exports `WRK2API_URL`.  Drive load with:
+
+    wrk -t2 -c10 -d30s -L -s ~/blueprint-docc-mod/examples/dsb_sn/scripts/compose-post.lua $WRK2API_URL -R100
+
+To replace it with another variant (the old one is evicted):
+
     source ~/blueprint-docc-mod/.venv/bin/activate
     cd ~/blueprint-docc-mod
-    utils/build_deploy_dsb.sh -s docker_pb_es -n pb_test --cpd 2 --gc natural --apply --seed
+    utils/build_deploy_dsb.sh -s docker_cgpb_es -n cgpb --cpd 2 --gc natural --no-pin-requests --apply --seed
 
 See `utils/build_deploy_dsb.sh -h` and `utils/User_Guide.md` in the fork for the full set of knobs.  Elasticsearch needs `vm.max_map_count=262144`; the profile sets that on every node.
 

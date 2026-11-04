@@ -3,10 +3,16 @@
 CloudLab profile for the Blueprint **bridges** / SLO-budget-sampling work.
 
 It is the stock Utah [k8s-profile](https://gitlab.flux.utah.edu/johnsond/k8s-profile)
-(Kubespray cluster, local registry, NFS storage class, dashboard) with one extra
-head-node stage, `setup-bridges.sh`, that clones and builds everything the
-DSB-SN bridge experiments need, plus an optional non-Kubernetes mode that gives
-a single docker-ce node with the same repos and toolchain.
+(Kubespray cluster, local registry, NFS storage class, dashboard) with two extra
+head-node stages. `setup-bridges.sh` clones and builds everything the DSB-SN
+bridge experiments need. `setup-deploy-bridges.sh` then deploys and seeds the
+bridge-instrumented Social Network and checks that it works.
+
+**The end state of a "ready" experiment is a running testbed:** the bridged
+DSB-SN services on the cluster, with a seeded social graph, the priority
+collector on every node, and Jaeger on Elasticsearch receiving traces. An
+optional non-Kubernetes mode gives a single docker-ce node with the same repos
+and toolchain, without the deployment.
 
 ## What you get on node-0
 
@@ -45,6 +51,12 @@ Bridges-specific (the rest are the unchanged k8s-profile parameters):
 | `bridgesPython` | on | `bridges/.venv` with numpy/pandas/scipy/matplotlib/seaborn. |
 | `installOrTools` / `orToolsVersion` | off | Prebuilt OR-Tools + `bridges/bin/trace_recon_cgprb` (cpsat build tag). |
 | `cpuPinGhz` | 0 | Pin every node's CPU clock via `utils/pin-cpu-22ghz.sh` (2.2 = paper setting). Not reboot-persistent. |
+| `deployApp` | on | Build, deploy, seed and verify DSB-SN at the end of setup. A failed check fails the setup. About 15 min. |
+| `deploySpec` | `docker_pb_es` | Variant: `docker_pb_es`, `docker_cgpb_es`, `docker_sb_es`, `docker_rc_es` or `docker_v_es`. |
+| `deployName` | `profile` | Names `examples/dsb_sn/build_<name>/` and `node-pinning-<name>.yaml`. |
+| `deployCpd` / `deployGc` | 2 / `natural` | Checkpoint distance and application GC mode. |
+| `deploySeed` | on | Seed the social graph. The load and trace checks are skipped when off. |
+| `deployPinRequests` | off | Keep the canonical CPU requests (needs roughly 40-core nodes and node-1..node-9). |
 
 Keep `containerManager=docker`, `doLocalRegistry=on` and `doNFS=on` (defaults):
 the build scripts use the docker CLI, the local-registry option is what marks
@@ -53,63 +65,45 @@ registry's PVC uses the `nfs-client` storage class.
 
 ## After setup
 
+`/local/setup/bridges-deployment.txt` records the variant, the wrk2api URL and
+the check results. New logins get `WRK2API_URL` from `~/bridges-env.sh`.
+
 ```sh
-source ~/bridges-env.sh                       # new logins do this automatically
+# drive load against the running application
+wrk -t2 -c10 -d30s -L -s ~/blueprint-docc-mod/examples/dsb_sn/scripts/compose-post.lua $WRK2API_URL -R100
+
+# re-run the health checks without rebuilding
+DEPLOYVERIFYONLY=1 /local/repository/setup-deploy-bridges.sh
+
+# replace it with another variant (the live one is evicted)
 source ~/blueprint-docc-mod/.venv/bin/activate
 cd ~/blueprint-docc-mod
-utils/build_deploy_dsb.sh -s docker_pb_es -n pb_test --cpd 2 --gc natural --apply --seed
+utils/build_deploy_dsb.sh -s docker_cgpb_es -n cgpb --cpd 2 --gc natural --no-pin-requests --apply --seed
 ```
 
-`utils/build_deploy_dsb.sh -h` lists the variants (`docker_pb_es`,
-`docker_cgpb_es`, `docker_sb_es`, `docker_v_es`, `docker_rc_es`) and knobs;
-`utils/User_Guide.md` and `utils/k8s-configuration.md` in the fork describe the
-experiment workflow.
+`utils/build_deploy_dsb.sh -h` lists the knobs; `utils/User_Guide.md` and
+`utils/k8s-configuration.md` in the fork describe the experiment workflow.
 
-**Cluster size.** When no `examples/dsb_sn/node-pinning-<name>.yaml` exists,
-`build_deploy_dsb.sh` generates the paper's placement, which pins services to
-`node-1` ... `node-9` (`node-0` is the tainted control plane). That is why
-`nodeCount` defaults to 10. On a smaller cluster the pinned pods stay
-`Pending` with "didn't match Pod's node affinity/selector"; write a pinning
-file for the nodes you have before running with `--apply`, e.g. fold the
-canonical layout onto three workers (service names are `<base>-<variant>-ctr`):
+The deploy stage fails the setup unless all of these hold:
 
-```yaml
-# examples/dsb_sn/node-pinning-pb_test.yaml
-node-1:
-  - composepost-service-pb-es-ctr: {requests_cpu: 12000, limits_cpu: 12000}
-  - hometimeline-cache-pb-es-ctr: {requests_cpu: 2000, limits_cpu: 2000}
-  - hometimeline-service-pb-es-ctr: {requests_cpu: 5000, limits_cpu: 5000}
-  - usertimeline-cache-pb-es-ctr: {requests_cpu: 2000, limits_cpu: 2000}
-  - usertimeline-db-pb-es-ctr: {requests_cpu: 11000, limits_cpu: 11000}
-  - usertimeline-service-pb-es-ctr: {requests_cpu: 8000, limits_cpu: 8000}
-  - urlshorten-db-pb-es-ctr: {requests_cpu: 2000, limits_cpu: 2000}
-  - urlshorten-service-pb-es-ctr: {requests_cpu: 5000, limits_cpu: 5000}
-node-2:
-  - social-cache-pb-es-ctr: {requests_cpu: 4000, limits_cpu: 4000}
-  - social-db-pb-es-ctr: {requests_cpu: 25000, limits_cpu: 25000}
-  - socialgraph-service-pb-es-ctr: {requests_cpu: 6000, limits_cpu: 6000}
-  - media-service-pb-es-ctr: {requests_cpu: 2000, limits_cpu: 2000}
-  - text-service-pb-es-ctr: {requests_cpu: 8000, limits_cpu: 8000}
-  - userid-service-pb-es-ctr: {requests_cpu: 6000, limits_cpu: 6000}
-  - user-service-pb-es-ctr: {requests_cpu: 3000, limits_cpu: 3000}
-  - user-cache-pb-es-ctr: {requests_cpu: 2000, limits_cpu: 2000}
-  - user-db-pb-es-ctr: {requests_cpu: 2000, limits_cpu: 2000}
-node-3:
-  - uniqueid-service-pb-es-ctr: {requests_cpu: 3000, limits_cpu: 3000}
-  - usermention-service-pb-es-ctr: {requests_cpu: 4000, limits_cpu: 4000}
-  - post-cache-pb-es-ctr: {requests_cpu: 2000, limits_cpu: 2000}
-  - post-db-pb-es-ctr: {requests_cpu: 3000, limits_cpu: 3000}
-  - post-storage-service-pb-es-ctr: {requests_cpu: 5000, limits_cpu: 5000}
-  - jaeger-pb-es-ctr: {requests_cpu: 20000, limits_cpu: 20000}
-  - elasticsearch-pb-es-ctr: {requests_cpu: 4000, limits_cpu: 4000}
-```
+- Every pod of the variant is Running and Ready.
+- A short wrk2 ComposePost run completes, with at most 1% non-2xx responses.
+- ComposePost traces can be fetched back from Jaeger. For `docker_pb_es`, their spans must also carry the `_br` bridge tag.
 
-and deploy with `--no-pin-requests` so the folded CPU requests do not
-over-reserve the nodes. Note that `--skip-build` regenerates the manifests with
-a new image tag without building those images (pods then fail with
-`ImagePullBackOff`); re-run without it to redeploy.
+**Cluster size.** The fork's canonical placement pins services to `node-1` ...
+`node-9` (`node-0` is the tainted control plane), which is why `nodeCount`
+defaults to 10. When those nodes are not all schedulable, the deploy stage folds
+the layout onto the nodes that are and leaves CPU requests out. The placement
+then differs from the paper setup, so use 10 nodes for measurements. A
+hand-written `examples/dsb_sn/node-pinning-<name>.yaml` always wins.
+
+CPU requests are off by default because the canonical values assume 40-core
+nodes. When redeploying by hand, note that `--skip-build` regenerates the
+manifests with a new image tag without building those images, so pods fail with
+`ImagePullBackOff`; re-run without it.
 
 Logs: `/local/logs/setup.log` (driver), `/local/logs/setup-bridges.sh.log`,
+`/local/logs/setup-deploy-bridges.sh.log`, `/local/setup/bridges-deploy-build.log`,
 `/local/setup/bridges-summary.txt`, `/local/setup/bridges-warnings.log`
 (non-fatal problems such as a failed optional build). Setup timing is in
 `/local/setup/setup-time.log`.
@@ -138,4 +132,5 @@ setup-nfs-*.sh, setup-nginx.sh, setup-ssl.sh, setup-kubespray.sh,
 setup-kubernetes-extra.sh, setup-end.sh, manifest-to-*.py, getmanifests.py
                         unchanged from k8s-profile
 setup-bridges.sh        node-0: repos, toolchain, builds, registry, env file
+setup-deploy-bridges.sh node-0: deploy, seed and verify the bridged DSB-SN
 ```

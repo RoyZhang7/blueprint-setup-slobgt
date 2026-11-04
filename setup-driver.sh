@@ -13,9 +13,10 @@ cd $SRC
 INSTALLKUBERNETES=${INSTALLKUBERNETES:-1}
 
 if [ "$INSTALLKUBERNETES" = "1" ]; then
-    # Stock k8s-profile pipeline, plus the bridges stack on the head node.
+    # Stock k8s-profile pipeline, then the bridges stack and the deployed,
+    # verified application on the head node.
     ALLNODESCRIPTS="setup-ssh.sh setup-disk-space.sh setup-sysctl.sh"
-    HEADNODESCRIPTS="setup-nfs-server.sh setup-nginx.sh setup-ssl.sh setup-kubespray.sh setup-kubernetes-extra.sh setup-bridges.sh setup-end.sh"
+    HEADNODESCRIPTS="setup-nfs-server.sh setup-nginx.sh setup-ssl.sh setup-kubespray.sh setup-kubernetes-extra.sh setup-bridges.sh setup-deploy-bridges.sh setup-end.sh"
     WORKERNODESCRIPTS="setup-nfs-client.sh"
 else
     # No Kubernetes: plain docker-ce host(s); repos + toolchain on the head node.
